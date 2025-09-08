@@ -1,0 +1,601 @@
+version: '3.8'
+
+# Railway QR Tracker - Production Docker Compose
+# Smart India Hackathon 2025 - Production Ready Deployment
+
+services:
+  # MySQL Database - Primary
+  mysql-primary:
+    image: mysql:8.0
+    container_name: railway-mysql-primary
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+    ports:
+      - "${DB_PORT}:3306"
+    volumes:
+      - mysql_primary_data:/var/lib/mysql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./database/my.cnf:/etc/mysql/conf.d/custom.cnf:ro
+      - ./backups/mysql:/var/backups/mysql
+    networks:
+      - railway-prod-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD}"]
+      timeout: 20s
+      retries: 10
+      interval: 30s
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        tag: "mysql-primary"
+
+  # MySQL Database - Read Replica (for analytics)
+  mysql-replica:
+    image: mysql:8.0
+    container_name: railway-mysql-replica
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password --read-only=1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_replica_data:/var/lib/mysql
+      - ./database/my.cnf:/etc/mysql/conf.d/custom.cnf:ro
+    networks:
+      - railway-prod-network
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+    profiles:
+      - replica
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+
+  # Redis Cache Cluster
+  redis-master:
+    image: redis:7-alpine
+    container_name: railway-redis-master
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --appendonly yes
+      --appendfsync everysec
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_master_data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - railway-prod-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Backend API Server - Multiple instances for load balancing
+  backend-1:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.prod
+      args:
+        NODE_ENV: production
+    container_name: railway-backend-1
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - DB_HOST=mysql-primary
+      - DB_PORT=3306
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - REDIS_HOST=redis-master
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - JWT_SECRET=${JWT_SECRET}
+      - API_RATE_LIMIT=${API_RATE_LIMIT}
+      - LOG_LEVEL=warn
+      - ENABLE_METRICS=true
+    ports:
+      - "3001:3000"
+    volumes:
+      - ../logs/backend-1:/app/logs
+      - ../uploads:/app/uploads
+      - ./ssl:/app/ssl:ro
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+    networks:
+      - railway-prod-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        tag: "backend-1"
+
+  backend-2:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.prod
+    container_name: railway-backend-2
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - DB_HOST=mysql-primary
+      - DB_PORT=3306
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - REDIS_HOST=redis-master
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - JWT_SECRET=${JWT_SECRET}
+      - API_RATE_LIMIT=${API_RATE_LIMIT}
+      - LOG_LEVEL=warn
+      - ENABLE_METRICS=true
+    ports:
+      - "3002:3000"
+    volumes:
+      - ../logs/backend-2:/app/logs
+      - ../uploads:/app/uploads
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+    networks:
+      - railway-prod-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - scale
+
+  # Frontend Application
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile.prod
+      args:
+        REACT_APP_API_URL: ${FRONTEND_API_URL}
+        REACT_APP_VERSION: ${PROJECT_VERSION}
+        GENERATE_SOURCEMAP: false
+    container_name: railway-frontend
+    restart: unless-stopped
+    environment:
+      - NGINX_PORT=3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../logs/frontend:/var/log/nginx
+    networks:
+      - railway-prod-network
+    depends_on:
+      - backend-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # UDM Integration API
+  udm-api:
+    build:
+      context: ../integration_apis
+      dockerfile: Dockerfile.prod
+      args:
+        SERVICE: udm
+        NODE_ENV: production
+    container_name: railway-udm-api
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - UDM_PORT=4000
+      - API_RATE_LIMIT=${API_RATE_LIMIT}
+      - LOG_LEVEL=warn
+      - REDIS_HOST=redis-master
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    ports:
+      - "${UDM_API_PORT}:4000"
+    volumes:
+      - ../logs/udm-api:/app/logs
+    networks:
+      - railway-prod-network
+    depends_on:
+      - redis-master
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # TMS Integration API
+  tms-api:
+    build:
+      context: ../integration_apis
+      dockerfile: Dockerfile.prod
+      args:
+        SERVICE: tms
+        NODE_ENV: production
+    container_name: railway-tms-api
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - TMS_PORT=5000
+      - API_RATE_LIMIT=${API_RATE_LIMIT}
+      - LOG_LEVEL=warn
+      - REDIS_HOST=redis-master
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    ports:
+      - "${TMS_API_PORT}:5000"
+    volumes:
+      - ../logs/tms-api:/app/logs
+    networks:
+      - railway-prod-network
+    depends_on:
+      - redis-master
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # Data Processing Pipeline
+  data-processor:
+    build:
+      context: ../data_processing
+      dockerfile: Dockerfile.prod
+    container_name: railway-data-processor
+    restart: unless-stopped
+    environment:
+      - DB_HOST=mysql-replica
+      - DB_PORT=3306
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - REDIS_HOST=redis-master
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - LOG_LEVEL=info
+      - PROCESSING_SCHEDULE=0 2 * * *  # Run daily at 2 AM
+    volumes:
+      - ../logs/data-processor:/app/logs
+      - ../data_processing/output:/app/output
+      - ../data_processing/models:/app/models
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+    networks:
+      - railway-prod-network
+    profiles:
+      - analytics
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+
+  # Nginx Load Balancer & Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: railway-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../config/nginx/nginx-prod.conf:/etc/nginx/nginx.conf:ro
+      - ../config/nginx/ssl.conf:/etc/nginx/conf.d/ssl.conf:ro
+      - ../config/ssl:/etc/nginx/ssl:ro
+      - ../static:/usr/share/nginx/html/static:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - backend-1
+      - frontend
+      - udm-api
+      - tms-api
+    networks:
+      - railway-prod-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: railway-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    ports:
+      - "${METRICS_PORT:-9090}:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    networks:
+      - railway-prod-network
+    profiles:
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: railway-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+      - GF_SERVER_ROOT_URL=https://monitoring.railway-tracker.gov.in
+    ports:
+      - "3030:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - railway-prod-network
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # ElasticSearch for Logging
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.15.2
+    container_name: railway-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - railway-prod-network
+    profiles:
+      - logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+
+  # Kibana for Log Visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.15.2
+    container_name: railway-kibana
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    networks:
+      - railway-prod-network
+    depends_on:
+      - elasticsearch
+    profiles:
+      - logging
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # Backup Service
+  backup-service:
+    build:
+      context: ../scripts
+      dockerfile: Dockerfile.backup
+    container_name: railway-backup-service
+    restart: unless-stopped
+    environment:
+      - DB_HOST=mysql-primary
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - BACKUP_SCHEDULE=0 2 * * *  # Daily at 2 AM
+      - RETENTION_DAYS=30
+      - S3_BUCKET=${BACKUP_S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - backup_data:/backups
+      - ../logs/backup:/app/logs
+    depends_on:
+      - mysql-primary
+    networks:
+      - railway-prod-network
+    profiles:
+      - backup
+
+  # SSL Certificate Renewal
+  certbot:
+    image: certbot/certbot
+    container_name: railway-certbot
+    restart: "no"
+    volumes:
+      - ../config/ssl:/etc/letsencrypt
+      - ../static:/var/www/html
+    command: certbot renew --quiet --no-self-upgrade
+    profiles:
+      - ssl-renewal
+
+volumes:
+  mysql_primary_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/railway-qr-tracker/mysql-primary
+
+  mysql_replica_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/railway-qr-tracker/mysql-replica
+
+  redis_master_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/railway-qr-tracker/redis
+
+  prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/railway-qr-tracker/prometheus
+
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/railway-qr-tracker/grafana
+
+  elasticsearch_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/railway-qr-tracker/elasticsearch
+
+  backup_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/railway-qr-tracker/backups
+
+  nginx_logs:
+    driver: local
+
+networks:
+  railway-prod-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+          gateway: 172.21.0.1
+      driver: default
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.driver.mtu: "1500"
+
+# Health check configuration
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 60s
